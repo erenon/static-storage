@@ -1,15 +1,18 @@
 #include <string>
 #include <vector>
 
-#include <elf.h>
-#include <link.h>
-#include <sys/auxv.h>
+#ifdef __linux__
+  #include <elf.h>
+  #include <link.h>
+#elif defined(__APPLE__)
+  #include <mach-o/loader.h>
+#endif
+
 #include <string.h>
 #include <stdexcept>
 #include <system_error>
 
 #include "MemoryMappedFile.hpp"
-
 
 // STORE(name, str)
 //
@@ -17,8 +20,14 @@
 
 #ifdef __clang__
 
+  #ifdef __APPLE__
+    #define SECTION_ATTR(name) __attribute__((section("__DATA_CONST," name), used))
+  #else
+    #define SECTION_ATTR(name) __attribute__((section(name), used))
+  #endif
+
   #define STORE(name, str) {               \
-    __attribute__((section(name), used))   \
+    SECTION_ATTR(name)                     \
     static constexpr const char s[] = str; \
   }                                        \
   /**/
@@ -35,23 +44,12 @@
 
 #endif
 
-// Get the path of the currently running binary
-inline const char* current_binary_path()
-{
-  char* path = nullptr;
-  long unsigned path_val = getauxval(AT_EXECFN);
-  memcpy(&path, &path_val, sizeof(path));
-
-  if (!path)
-  {
-    throw std::runtime_error("Failed to get binary path");
-  }
-  return path;
-}
-
 // Get every string STOREd in `name` in the binary at `path`.
-inline std::vector<std::string> fetch(const char* name, const char* path = current_binary_path())
+inline std::vector<std::string> fetch(const char* name, const char* path)
 {
+  std::vector<std::string> result;
+
+#ifdef __linux__
   const MemoryMappedFile f(path);
   ElfW(Ehdr) ehdr;
   f.read(0, sizeof(ehdr), &ehdr);
@@ -60,8 +58,6 @@ inline std::vector<std::string> fetch(const char* name, const char* path = curre
   f.read(ehdr.e_shoff, shdrs.size() * sizeof(ElfW(Shdr)), shdrs.data());
 
   const ElfW(Off) string_table_offset = shdrs.at(ehdr.e_shstrndx).sh_offset;
-
-  std::vector<std::string> result;
 
   for (const ElfW(Shdr)& shdr : shdrs)
   {
@@ -76,6 +72,48 @@ inline std::vector<std::string> fetch(const char* name, const char* path = curre
       }
     }
   }
+#elif defined(__APPLE__)
+  #ifdef __LP64__
+    #define MachW(x) x ## _64
+  #else
+    #define MachW(x) x
+  #endif
+
+  const MemoryMappedFile f(path);
+  MachW(mach_header) mhdr;
+  f.read(0, sizeof(mhdr), &mhdr);
+
+  std::size_t offset = sizeof(mhdr);
+  for (uint32_t i = 0; i < mhdr.ncmds; ++i)
+  {
+    load_command lc;
+    f.read(offset, sizeof(lc), &lc);
+    if (lc.cmd == LC_SEGMENT || lc.cmd == LC_SEGMENT_64) {
+      MachW(segment_command) sc;
+      f.read(offset, sizeof(sc), &sc);
+      if (strcmp(sc.segname, "__DATA_CONST") == 0)
+      {
+        std::size_t soffset = offset + sizeof(sc);
+        for (uint32_t j = 0; j < sc.nsects; ++j)
+        {
+          MachW(section) s;
+          f.read(soffset, sizeof(s), &s);
+          if (strcmp(s.sectname, name) == 0)
+          {
+            for (uint64_t doffset = 0; doffset < s.size;)
+            {
+              const std::string_view str = f.string(s.offset + doffset);
+              result.emplace_back(str);
+              doffset += str.size() + 1;
+            }
+          }
+          soffset += sizeof(s);
+        }
+      }
+    }
+    offset += lc.cmdsize;
+  }
+#endif
 
   return result;
 }
